@@ -44,7 +44,7 @@ cleanup() {
 trap cleanup EXIT
 
 log "up $name"
-"$helper" up --name "$slug" --port "$port" 2>&1 | { grep -v "API key:" || true; } | tee "$E2E_DIR/up.log"
+"$helper" up --name "$slug" --port "$port" 2>&1 | { grep --line-buffered -v "API key:" || true; } | tee "$E2E_DIR/up.log"
 id=$(grep -o 'sbx_[0-9a-f]\{24\}' "$E2E_DIR/up.log" | head -n 1); [ -n "$id" ] || id=$(sid)
 [ -n "$id" ] || fail "no sandbox named $name"
 curl -fsS "http://127.0.0.1:$port/health" >/dev/null || fail "backend not reachable on 127.0.0.1:$port"
@@ -53,7 +53,7 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/api/conver
 log "backend up on 127.0.0.1:$port; requests without the key get $code"
 
 "$helper" key "$id" OPENAI_API_KEY <"$OPENAI_KEY_FILE" 2>&1
-"$helper" connect "$id" --port "$port" 2>&1 | { grep -v "API key:" || true; }
+"$helper" connect "$id" --port "$port" 2>&1 | { grep --line-buffered -v "API key:" || true; }
 "$SDK_PYTHON" -I "$repo/scripts/31-backend-task.py" "http://127.0.0.1:$port" "$E2E_DIR/state/$id.key" "$model" \
   >"$E2E_DIR/task.log" 2>&1 || { tail -n 30 "$E2E_DIR/task.log"; fail "task did not complete"; }
 grep -E '^(server|result):' "$E2E_DIR/task.log"
@@ -63,7 +63,7 @@ log "metering: $(rzv sandboxes get "$id" | grep -i 'credits')"
 for _ in $(seq 36); do rzv sandboxes get "$id" | head -n 1 | grep -q ': stopped$' && break; sleep 5; done
 rzv sandboxes get "$id" | head -n 1
 "$helper" start "$id" >/dev/null 2>&1
-"$helper" connect "$id" --port "$port" 2>&1 | { grep -v "API key:" || true; }
+"$helper" connect "$id" --port "$port" 2>&1 | { grep --line-buffered -v "API key:" || true; }
 rzv sandboxes exec "$id" -- 'cat /workspace/backend-ok.txt' | grep -q runzivo-backend-ok || fail "/workspace lost after stop and start"
 rc=0; ssh -o BatchMode=yes "$id.rzv" 'grep -rlF -f ~/.config/rzv-openhands/env/OPENAI_API_KEY /workspace' >/dev/null 2>&1 || rc=$?
 [ "$rc" = 1 ] || fail "the /workspace key check did not run cleanly or found the key (status $rc)"
