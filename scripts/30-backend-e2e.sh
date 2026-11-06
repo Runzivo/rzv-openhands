@@ -42,11 +42,13 @@ cleanup() {
     pkill -f -- "-L 127.0.0.1:$port:127.0.0.1:8000 $id.rzv" 2>/dev/null
     # Stop the agent server (it holds the key in its environment) and delete the key file.
     if ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=10 -o ServerAliveCountMax=2 "$id.rzv" \
-      'pkill -f "^$HOME/.local/bin/openhands-agent-server-[0-9.]* --host 127.0.0.1 --port 8000"; rm -f ~/.config/rzv-openhands/env/OPENAI_API_KEY && ! test -e ~/.config/rzv-openhands/env/OPENAI_API_KEY' \
-      </dev/null >/dev/null 2>&1; then
+      'p="^$HOME/.local/bin/openhands-agent-server-[0-9.]* --host 127.0.0.1 --port 8000"; pkill -f "$p"
+       for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -f "$p" >/dev/null || break; sleep 1; done
+       ! pgrep -f "$p" >/dev/null && rm -f ~/.config/rzv-openhands/env/OPENAI_API_KEY && ! test -e ~/.config/rzv-openhands/env/OPENAI_API_KEY' \
+      </dev/null >/dev/null 2>"$E2E_DIR/keep-cleanup.err"; then
       log "cleanup: KEPT $id ($name) for diagnosis; agent server stopped and provider key removed. Delete it later with: rzv sandboxes delete $id"
     else
-      log "cleanup: KEPT $id ($name) for diagnosis, but COULD NOT remove the provider key from it; delete the sandbox or remove ~/.config/rzv-openhands/env/OPENAI_API_KEY by hand"
+      log "cleanup: KEPT $id ($name) for diagnosis, but COULD NOT stop its agent server or remove the provider key ($(tail -n 3 "$E2E_DIR/keep-cleanup.err" | tr '\n' ' ')); delete the sandbox, or stop the server and remove ~/.config/rzv-openhands/env/OPENAI_API_KEY by hand"
     fi
   elif [ -n "$id" ]; then log "cleanup: deleting $id ($name)"; "$helper" down "$id" --yes >/dev/null; fi
   if leak; then printf 'FAIL: the API key appears under %s\n' "$E2E_DIR" >&2; fi
