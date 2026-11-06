@@ -79,17 +79,18 @@ for f in sys.argv[1:]:
         a=e.get("action") or {}
         if e.get("kind")=="ActionEvent" and a.get("command"): print(a["command"])' "$@"
 }
-ran() { cmds "$last" | grep -- "$1" >/dev/null; }
+ran() { cmds "${step_logs[@]}" | grep -- "$1" >/dev/null; } # any turn of the current step
 conv() { grep -o 'Conversation ID: [0-9a-f]*' "$last" | head -n 1 | awk '{print $3}'; }
 
 step() { # step <check-function> <prompt>: one headless run; if the check fails, resume it with "Continue" up to 3 times
   local c tries=0
-  turn "$2"
+  step_logs=()
+  turn "$2"; step_logs+=("$last")
   until "$1"; do
     tries=$((tries + 1)); c=$(conv)
     [ "$tries" -le 3 ] && [ -n "$c" ] || fail "turn $n: $1 failed"
     log "turn $n: $1 not done yet; the model stopped early, resuming the conversation"
-    turn "Continue until the task is done." "$c"
+    turn "Continue until the task is done." "$c"; step_logs+=("$last")
   done
 }
 created() { sid=$(ids | awk -v n="$name" '$2 == n {print $1}'); [ -n "$sid" ] && settle running; }
@@ -109,6 +110,7 @@ step stopped "In the terminal, use rzv to stop Runzivo sandbox $sid."
 step woke "In the terminal, use rzv to start Runzivo sandbox $sid, wait until it is running, then print /workspace/e2e.txt from it."
 log "/workspace survived stop and start"
 turn "In the terminal, use rzv to delete Runzivo sandbox $sid."
+step_logs=("$last")
 asked || fail "delete ran without the user's confirmation"
 log "delete without confirmation was not run; sandbox still $(field status)"
 step deleted "Yes, I confirm. In the terminal, use rzv to delete Runzivo sandbox $sid (named $name) now."

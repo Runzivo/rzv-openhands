@@ -65,9 +65,12 @@ fi
 [ -s "$d/session.key" ] || { echo "session key missing" >&2; exit 1; }
 [ -s "$d/secret.key" ] || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$d/secret.key"
 # Stop a server this helper started earlier: match its exact binary path, not a saved pid.
-pkill -f "^$bin --host 127.0.0.1 --port $PORT" 2>/dev/null || true
-for _ in $(seq 30); do pgrep -f "^$bin --host 127.0.0.1 --port $PORT" >/dev/null || break; sleep 1; done
-pgrep -f "^$bin --host 127.0.0.1 --port $PORT" >/dev/null && { echo "the old agent server did not stop" >&2; exit 1; }
+# Any version this helper installed counts, so an upgrade replaces the old server.
+old="^$HOME/.local/bin/openhands-agent-server-[0-9.]* --host 127.0.0.1 --port $PORT"
+pkill -f "$old" 2>/dev/null || true
+for _ in $(seq 30); do pgrep -f "$old" >/dev/null || break; sleep 1; done
+pgrep -f "$old" >/dev/null && { echo "the old agent server did not stop" >&2; exit 1; }
+curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && { echo "port $PORT in the sandbox is already in use" >&2; exit 1; }
 (
   for f in "$d"/env/*; do [ -s "$f" ] && export "$(basename "$f")=$(cat "$f")"; done
   OH_SESSION_API_KEYS_0=$(cat "$d/session.key") OH_SECRET_KEY=$(cat "$d/secret.key")
@@ -135,7 +138,9 @@ main() {
       id=$(rzv sandboxes create --name "openhands-$slug" ${args[@]+"${args[@]}"} --json | grep -o 'sbx_[0-9a-f]\{24\}' | head -n 1) || true
       check_id "$id"
       say "Created openhands-$slug [$id]. Waiting for it to run..."
-      trap 'say "Setup failed. The sandbox still exists and is billed while it runs; delete it with: rzv-openhands-backend down $id"' EXIT
+      # $id is expanded now (check_id validated it): bash 3.2 drops function locals before an EXIT trap runs.
+      # shellcheck disable=SC2064
+      trap "say 'Setup failed. The sandbox still exists and is billed while it runs; delete it with: rzv-openhands-backend down $id'" EXIT
       (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$STATE/$id.key")
       connect "$id" "$port"
       trap - EXIT ;;

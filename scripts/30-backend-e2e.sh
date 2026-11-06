@@ -65,9 +65,8 @@ rzv sandboxes get "$id" | head -n 1
 "$helper" start "$id" >/dev/null 2>&1
 "$helper" connect "$id" --port "$port" 2>&1 | { grep -v "API key:" || true; }
 rzv sandboxes exec "$id" -- 'cat /workspace/backend-ok.txt' | grep -q runzivo-backend-ok || fail "/workspace lost after stop and start"
-if ssh -o BatchMode=yes "$id.rzv" 'grep -rlF -f ~/.config/rzv-openhands/env/OPENAI_API_KEY /workspace' >/dev/null 2>&1; then
-  fail "the provider key appears under /workspace in the sandbox"
-fi
+rc=0; ssh -o BatchMode=yes "$id.rzv" 'grep -rlF -f ~/.config/rzv-openhands/env/OPENAI_API_KEY /workspace' >/dev/null 2>&1 || rc=$?
+[ "$rc" = 1 ] || fail "the /workspace key check did not run cleanly or found the key (status $rc)"
 log "the provider key is not under /workspace in the sandbox"
 log "after stop, start and reconnect the backend answers and /workspace kept the task's file"
 
