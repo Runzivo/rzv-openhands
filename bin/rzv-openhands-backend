@@ -87,9 +87,12 @@ tunnel_pattern() { printf -- '-L 127.0.0.1:%s:127.0.0.1:%s %s.rzv' "$2" "$REMOTE
 close_tunnel() { pkill -f -- "$(tunnel_pattern "$1" "$2")" 2>/dev/null || true; }
 open_tunnel() {
   close_tunnel "$1" "$2"
+  # The backgrounded ssh must not keep the caller's stdout or stderr open, or a pipe
+  # reading this command's output never ends. Its messages go to a log file instead.
   # shellcheck disable=SC2046 # the pattern is the exact option list
   ssh -f -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 $(tunnel_pattern "$1" "$2") \
-    || die "could not open the tunnel; is local port $2 free?"
+    </dev/null >/dev/null 2>"$STATE/$1.tunnel.log" \
+    || die "could not open the tunnel (local port $2 in use, or sandbox SSH unreachable): $(tail -n 3 "$STATE/$1.tunnel.log" | tr '\n' ' ')"
   for _ in $(seq 20); do curl -fsS "http://127.0.0.1:$2/health" >/dev/null 2>&1 && return 0; sleep 1; done
   die "tunnel is open but the agent server does not answer on 127.0.0.1:$2"
 }
@@ -175,7 +178,7 @@ main() {
       fi
       close_tunnel "$id" "$(cat "$STATE/$id.port" 2>/dev/null || echo 8000)"
       rzv sandboxes delete "$id"
-      rm -f "$STATE/$id.key" "$STATE/$id.port" ;;
+      rm -f "$STATE/$id.key" "$STATE/$id.port" "$STATE/$id.tunnel.log" ;;
     *) usage; exit 2 ;;
   esac
 }
