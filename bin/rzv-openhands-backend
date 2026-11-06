@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# Run an OpenHands Agent Server in a Runzivo sandbox and reach it through an SSH tunnel.
+# It only calls the rzv CLI and OpenSSH. See docs/backend.md.
+set -euo pipefail
+
+AGENT_SERVER_VERSION=1.60.1
+AGENT_SERVER_SHA256=b2fbcf8cf1495bdbef97f26583917bc188b765c71c181effc3e47c14da08ce72 # agent-server-1.60.1-linux-x86_64
+REMOTE_PORT=8000
+STATE=${RZV_OPENHANDS_STATE:-${XDG_CONFIG_HOME:-$HOME/.config}/rzv-openhands}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  rzv-openhands-backend up [--name <slug>] [--size <size>] [--lifetime 8h|12h|24h] [--port <local-port>]
+  rzv-openhands-backend connect <sandbox-id> [--port <local-port>]   # after start, or a lost tunnel
+  rzv-openhands-backend key <sandbox-id> <ENV_NAME>                   # reads a provider key from stdin
+  rzv-openhands-backend status <sandbox-id>
+  rzv-openhands-backend stop|start <sandbox-id>
+  rzv-openhands-backend down <sandbox-id> [--yes]                     # deletes the sandbox
+
+The backend URL is http://127.0.0.1:<local-port> (default 8000). Its API key is in
+~/.config/rzv-openhands/<sandbox-id>.key; paste it into Agent Canvas or the SDK.
+EOF
+}
+die() { printf 'rzv-openhands-backend: %s\n' "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*" >&2; }
+
+find_rzv() {
+  if [ -n "${RZV_BIN:-}" ]; then RZV=$RZV_BIN
+  elif command -v rzv >/dev/null 2>&1; then RZV=$(command -v rzv)
+  elif [ -x "$HOME/.local/bin/rzv" ]; then RZV=$HOME/.local/bin/rzv
+  else die "rzv is not installed. Install it with: curl -fsSL https://runzivo.dev/downloads/rzv/install.sh | sh"
+  fi
+  command -v ssh >/dev/null 2>&1 || die "OpenSSH (ssh) is required."
+}
+rzv() { "$RZV" "$@"; }
+check_id() { [[ "${1:-}" =~ ^sbx_[0-9a-f]{24}$ ]] || die "expected a sandbox id like sbx_<24 hex characters>"; }
+status_of() { rzv sandboxes get "$1" | head -n 1 | sed 's/.*]: //'; }
+wait_running() {
+  local s=""
+  for _ in $(seq 60); do
+    s=$(status_of "$1") || die "could not read sandbox $1"
+    case "$s" in running) return 0 ;; failed*|deleted*|expired*) break ;; esac
+    sleep 5
+  done
+  rzv sandboxes get "$1" >&2 || true
+  die "sandbox $1 is not running (status: ${s:-unknown})"
+}
+
+# The remote script runs in the sandbox over SSH. It installs the pinned agent server,
+# checks its SHA-256, and (re)starts it on 127.0.0.1 with keys read from mode 600 files.
+remote_start() {
+  ssh -o BatchMode=yes "$1.rzv" "V=$AGENT_SERVER_VERSION SHA=$AGENT_SERVER_SHA256 PORT=$REMOTE_PORT bash -s" <<'REMOTE'
+set -eu
+umask 077
+d=$HOME/.config/rzv-openhands; bin=$HOME/.local/bin/openhands-agent-server-$V
+mkdir -p "$d/env" "$HOME/.local/bin" /workspace/openhands
+[ "$(uname -m)" = x86_64 ] || { echo "unsupported architecture $(uname -m)" >&2; exit 1; }
+if [ ! -x "$bin" ]; then
+  curl -fsSL --proto '=https' -o "$bin.tmp" \
+    "https://github.com/OpenHands/software-agent-sdk/releases/download/v$V/agent-server-$V-linux-x86_64"
+  echo "$SHA  $bin.tmp" | sha256sum -c - >/dev/null || { rm -f "$bin.tmp"; echo "agent server checksum mismatch" >&2; exit 1; }
+  chmod 700 "$bin.tmp" && mv "$bin.tmp" "$bin"
+fi
+[ -s "$d/session.key" ] || { echo "session key missing" >&2; exit 1; }
+[ -s "$d/secret.key" ] || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$d/secret.key"
+if [ -f "$d/pid" ] && kill -0 "$(cat "$d/pid")" 2>/dev/null; then kill "$(cat "$d/pid")"; sleep 2; fi
+(
+  for f in "$d"/env/*; do [ -f "$f" ] && export "$(basename "$f")=$(cat "$f")"; done
+  OH_SESSION_API_KEYS_0=$(cat "$d/session.key") OH_SECRET_KEY=$(cat "$d/secret.key")
+  export OH_SESSION_API_KEYS_0 OH_SECRET_KEY OH_CONVERSATIONS_PATH=/workspace/openhands/conversations OH_WORKSPACE_PATH=/workspace
+  cd /workspace && nohup "$bin" --host 127.0.0.1 --port "$PORT" >"$d/agent-server.log" 2>&1 </dev/null &
+  echo $! >"$d/pid"
+)
+for _ in $(seq 60); do curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && exit 0; sleep 2; done
+echo "agent server did not start; see ~/.config/rzv-openhands/agent-server.log in the sandbox" >&2; exit 1
+REMOTE
+}
+
+tunnel_pattern() { printf -- '-L 127.0.0.1:%s:127.0.0.1:%s %s.rzv' "$2" "$REMOTE_PORT" "$1"; }
+close_tunnel() { pkill -f -- "$(tunnel_pattern "$1" "$2")" 2>/dev/null || true; }
+open_tunnel() {
+  close_tunnel "$1" "$2"
+  # shellcheck disable=SC2046 # the pattern is the exact option list
+  ssh -f -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 $(tunnel_pattern "$1" "$2") \
+    || die "could not open the tunnel; is local port $2 free?"
+  for _ in $(seq 20); do curl -fsS "http://127.0.0.1:$2/health" >/dev/null 2>&1 && return 0; sleep 1; done
+  die "tunnel is open but the agent server does not answer on 127.0.0.1:$2"
+}
+
+connect() { # connect <id> <port>
+  wait_running "$1"
+  rzv sandboxes ssh-config "$1" --write >/dev/null
+  [ -s "$STATE/$1.key" ] || die "no API key for $1 in $STATE; was it created with 'up'?"
+  ssh -o BatchMode=yes "$1.rzv" 'umask 077; mkdir -p ~/.config/rzv-openhands && cat > ~/.config/rzv-openhands/session.key' <"$STATE/$1.key"
+  remote_start "$1"
+  open_tunnel "$1" "$2"
+  echo "$2" >"$STATE/$1.port"
+  say "Agent Server for $1 is at http://127.0.0.1:$2"
+  say "API key: $STATE/$1.key (copy it, for example: pbcopy < $STATE/$1.key)"
+  say "Agent Canvas: Manage Backends > Add Backend, Host http://127.0.0.1:$2, paste the key."
+  say "Delete it when done: rzv-openhands-backend down $1"
+}
+
+port_arg() { [[ "$1" =~ ^[0-9]{2,5}$ ]] || die "--port must be a number"; echo "$1"; }
+
+main() {
+  [ $# -ge 1 ] || { usage; exit 2; }
+  local cmd=$1; shift
+  case "$cmd" in -h|--help|help) usage; exit 0 ;; esac
+  find_rzv
+  mkdir -p "$STATE" && chmod 700 "$STATE"
+  case "$cmd" in
+    up)
+      local slug port=8000 args=()
+      slug=backend-$(date -u +%m%d%H%M%S)
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --name) slug=${2:?}; shift 2 ;;
+          --size) args+=(--size "${2:?}"); shift 2 ;;
+          --lifetime) args+=(--lifetime "${2:?}"); shift 2 ;;
+          --port) port=$(port_arg "${2:?}"); shift 2 ;;
+          *) die "unknown option $1" ;;
+        esac
+      done
+      [[ "$slug" =~ ^[a-z0-9][a-z0-9-]{0,60}$ ]] || die "--name: use lowercase letters, digits and hyphens"
+      rzv whoami >/dev/null || die "sign in with: rzv login"
+      local id
+      id=$(rzv sandboxes create --name "openhands-$slug" ${args[@]+"${args[@]}"} --json | grep -o 'sbx_[0-9a-f]\{24\}' | head -n 1) || true
+      check_id "$id"
+      say "Created openhands-$slug [$id]. Waiting for it to run..."
+      (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$STATE/$id.key")
+      connect "$id" "$port" ;;
+    connect)
+      check_id "${1:-}"; local id=$1 port; shift
+      port=$(cat "$STATE/$id.port" 2>/dev/null || echo 8000)
+      [ "${1:-}" = --port ] && port=$(port_arg "${2:?}")
+      connect "$id" "$port" ;;
+    key)
+      check_id "${1:-}"; [[ "${2:-}" =~ ^[A-Z][A-Z0-9_]{1,63}$ ]] || die "usage: key <sandbox-id> <ENV_NAME> < key-file"
+      [ -t 0 ] && die "pipe the key on stdin, for example: <password-manager-command> | rzv-openhands-backend key $1 $2"
+      rzv sandboxes ssh-config "$1" --write >/dev/null
+      ssh -o BatchMode=yes "$1.rzv" "umask 077; mkdir -p ~/.config/rzv-openhands/env && cat > ~/.config/rzv-openhands/env/$2"
+      say "Saved $2 in the sandbox (mode 600). Run 'rzv-openhands-backend connect $1' to restart the server with it." ;;
+    status) check_id "${1:-}"; rzv sandboxes get "$1" ;;
+    stop) check_id "${1:-}"; close_tunnel "$1" "$(cat "$STATE/$1.port" 2>/dev/null || echo 8000)"; rzv sandboxes stop "$1" ;;
+    start) check_id "${1:-}"; rzv sandboxes start "$1"; say "Then run: rzv-openhands-backend connect $1" ;;
+    down)
+      check_id "${1:-}"; local id=$1
+      if [ "${2:-}" != --yes ]; then
+        [ -t 0 ] || die "add --yes to delete $id without a prompt"
+        rzv sandboxes get "$id" | head -n 1 >&2
+        read -r -p "Delete this sandbox and all its files? [y/N] " a; [ "$a" = y ] || [ "$a" = Y ] || die "not deleted"
+      fi
+      close_tunnel "$id" "$(cat "$STATE/$id.port" 2>/dev/null || echo 8000)"
+      rzv sandboxes delete "$id"
+      rm -f "$STATE/$id.key" "$STATE/$id.port" ;;
+    *) usage; exit 2 ;;
+  esac
+}
+main "$@"
