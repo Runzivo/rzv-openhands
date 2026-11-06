@@ -88,7 +88,7 @@ step() { # step <check-function> <prompt>: one headless run; if the check fails,
   turn "$2"; step_logs+=("$last")
   until "$1"; do
     tries=$((tries + 1)); c=$(conv)
-    [ "$tries" -le 3 ] && [ -n "$c" ] || fail "turn $n: $1 failed"
+    if [ "$tries" -gt 3 ] || [ -z "$c" ]; then fail "turn $n: $1 failed"; fi
     log "turn $n: $1 not done yet; the model stopped early, resuming the conversation"
     turn "Continue until the task is done." "$c"; step_logs+=("$last")
   done

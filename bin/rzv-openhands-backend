@@ -111,7 +111,10 @@ connect() { # connect <id> <port>
   say "Delete it when done: rzv-openhands-backend down $1"
 }
 
-port_arg() { [[ "$1" =~ ^[0-9]{4,5}$ ]] && [ "$1" -ge 1024 ] && [ "$1" -le 65535 ] || die "--port must be 1024 to 65535"; echo "$1"; }
+port_arg() {
+  if ! [[ "$1" =~ ^[0-9]{4,5}$ ]] || [ "$1" -lt 1024 ] || [ "$1" -gt 65535 ]; then die "--port must be 1024 to 65535"; fi
+  echo "$1"
+}
 
 main() {
   [ $# -ge 1 ] || { usage; exit 2; }
@@ -151,8 +154,9 @@ main() {
       connect "$id" "$port" ;;
     key)
       check_id "${1:-}"
-      [[ "${2:-}" =~ ^[A-Z][A-Z0-9_]{0,50}_(API_KEY|KEY|TOKEN)$ ]] && [[ ! "$2" =~ ^(OH_|SESSION_) ]] \
-        || die "usage: key <sandbox-id> <NAME_API_KEY> < key-file (a name ending in _API_KEY, _KEY or _TOKEN)"
+      if ! [[ "${2:-}" =~ ^[A-Z][A-Z0-9_]{0,50}_(API_KEY|KEY|TOKEN)$ ]] || [[ "$2" =~ ^(OH_|SESSION_) ]]; then
+        die "usage: key <sandbox-id> <NAME_API_KEY> < key-file (a name ending in _API_KEY, _KEY or _TOKEN)"
+      fi
       [ -t 0 ] && die "pipe the key on stdin, for example: <password-manager-command> | rzv-openhands-backend key $1 $2"
       rzv sandboxes ssh-config "$1" --write >/dev/null
       local k; k=$(cat); [ -n "$k" ] || die "no key on stdin; nothing was saved"
