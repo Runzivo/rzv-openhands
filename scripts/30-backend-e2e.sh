@@ -13,7 +13,7 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 helper=$repo/bin/rzv-openhands-backend
 model=${MODEL:-openai/gpt-5-nano} port=${PORT:-18000}
 lock=${RZV_E2E_LOCK:-$HOME/runzivo/tmp/shared-sandbox.lock}
-slug=e2e$(date -u +%H%M%S) name="" id=""
+slug=e2e$(date -u +%H%M%S) name="" id="" keep=""
 log() { printf '== %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
@@ -37,7 +37,20 @@ cleanup() {
   set +e
   [ -n "$id" ] || id=$(grep -o 'sbx_[0-9a-f]\{24\}' "$E2E_DIR/up.log" 2>/dev/null | head -n 1)
   [ -n "$id" ] || id=$(sid)
-  if [ -n "$id" ]; then log "cleanup: deleting $id ($name)"; "$helper" down "$id" --yes >/dev/null; fi
+  if [ -n "$id" ] && [ -n "$keep" ]; then
+    # Kept for a host check: close the tunnel and remove the test's provider key from the sandbox.
+    pkill -f -- "-L 127.0.0.1:$port:127.0.0.1:8000 $id.rzv" 2>/dev/null
+    # Stop the agent server (it holds the key in its environment) and delete the key file.
+    if ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=10 -o ServerAliveCountMax=2 "$id.rzv" \
+      'p="^$HOME/.local/bin/openhands-agent-server-[0-9.]* --host 127.0.0.1 --port 8000"; pkill -f "$p"
+       for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -f "$p" >/dev/null || break; sleep 1; done
+       ! pgrep -f "$p" >/dev/null && rm -f ~/.config/rzv-openhands/env/OPENAI_API_KEY && ! test -e ~/.config/rzv-openhands/env/OPENAI_API_KEY' \
+      </dev/null >/dev/null 2>"$E2E_DIR/keep-cleanup.err"; then
+      log "cleanup: KEPT $id ($name) for diagnosis; agent server stopped and provider key removed. Delete it later with: rzv sandboxes delete $id"
+    else
+      log "cleanup: KEPT $id ($name) for diagnosis, but COULD NOT stop its agent server or remove the provider key ($(tail -n 3 "$E2E_DIR/keep-cleanup.err" | tr '\n' ' ')); delete the sandbox, or stop the server and remove ~/.config/rzv-openhands/env/OPENAI_API_KEY by hand"
+    fi
+  elif [ -n "$id" ]; then log "cleanup: deleting $id ($name)"; "$helper" down "$id" --yes >/dev/null; fi
   if leak; then printf 'FAIL: the API key appears under %s\n' "$E2E_DIR" >&2; fi
   rm -rf "$E2E_DIR/state"; rm -f "$lock/owner"; rmdir "$lock"
 }
@@ -64,7 +77,25 @@ for _ in $(seq 36); do rzv sandboxes get "$id" | head -n 1 | grep -q ': stopped$
 rzv sandboxes get "$id" | head -n 1
 "$helper" start "$id" >/dev/null 2>&1
 "$helper" connect "$id" --port "$port" 2>&1 | { grep --line-buffered -v "API key:" || true; }
-rzv sandboxes exec "$id" -- 'cat /workspace/backend-ok.txt' | grep -q runzivo-backend-ok || fail "/workspace lost after stop and start"
+# Read-back after stop, start and reconnect, with diagnostics. On failure the sandbox is kept.
+readback() { # readback <label>: exec cat, logging stdout, stderr and exit status
+  local rc=0
+  rzv sandboxes exec "$id" -- 'cat /workspace/backend-ok.txt' >"$E2E_DIR/readback-$1.out" 2>"$E2E_DIR/readback-$1.err" || rc=$?
+  log "read-back $1 at $(date -u +%T): exit $rc, stdout '$(head -c 200 "$E2E_DIR/readback-$1.out")', stderr '$(head -c 300 "$E2E_DIR/readback-$1.err" | tr '\n' ' ')'"
+  grep -q runzivo-backend-ok "$E2E_DIR/readback-$1.out"
+}
+ok=""
+readback t0 && ok=1
+rzv sandboxes exec "$id" -- 'ls -la /workspace; echo "-- mount"; mount | grep -i workspace; echo "-- df"; df -h /workspace' \
+  >"$E2E_DIR/workspace-diag.txt" 2>&1 || true
+log "workspace diagnostics:"; sed 's/^/   /' "$E2E_DIR/workspace-diag.txt"
+sleep 10; readback t10 && ok=${ok:-later}
+sleep 20; readback t30 && ok=${ok:-later}
+case "$ok" in
+  1) ;;
+  later) keep=1; fail "/workspace file appeared only after a delay (not at t+0)" ;;
+  *) keep=1; fail "/workspace lost after stop and start (t+0, t+10 s and t+30 s)" ;;
+esac
 # The provider key file must survive the stop and start, and no file under /workspace may hold the key.
 # grep: 1 = no match, 0 = match, 2 = error (its stderr names the file; without -s so it is kept).
 kf=$(ssh -o BatchMode=yes "$id.rzv" 'f=~/.config/rzv-openhands/env/OPENAI_API_KEY; if [ -s "$f" ]; then stat -c %a "$f"; else echo missing; fi' 2>"$E2E_DIR/keyfile.err") \
