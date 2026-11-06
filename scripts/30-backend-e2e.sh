@@ -65,9 +65,20 @@ rzv sandboxes get "$id" | head -n 1
 "$helper" start "$id" >/dev/null 2>&1
 "$helper" connect "$id" --port "$port" 2>&1 | { grep --line-buffered -v "API key:" || true; }
 rzv sandboxes exec "$id" -- 'cat /workspace/backend-ok.txt' | grep -q runzivo-backend-ok || fail "/workspace lost after stop and start"
-rc=0; ssh -o BatchMode=yes "$id.rzv" 'grep -rlF -f ~/.config/rzv-openhands/env/OPENAI_API_KEY /workspace' >/dev/null 2>&1 || rc=$?
-[ "$rc" = 1 ] || fail "the /workspace key check did not run cleanly or found the key (status $rc)"
-log "the provider key is not under /workspace in the sandbox"
+# The provider key file must survive the stop and start, and no file under /workspace may hold the key.
+# grep: 1 = no match, 0 = match, 2 = error (its stderr names the file; without -s so it is kept).
+kf=$(ssh -o BatchMode=yes "$id.rzv" 'f=~/.config/rzv-openhands/env/OPENAI_API_KEY; if [ -s "$f" ]; then stat -c %a "$f"; else echo missing; fi' 2>"$E2E_DIR/keyfile.err") \
+  || fail "could not check the key file over SSH: $(head -n 3 "$E2E_DIR/keyfile.err")"
+[ "$kf" = 600 ] || fail "the provider key file after stop and start is '$kf', expected mode 600"
+rc=0
+ssh -o BatchMode=yes "$id.rzv" 'grep -rlF -f ~/.config/rzv-openhands/env/OPENAI_API_KEY /workspace' \
+  >"$E2E_DIR/keycheck.out" 2>"$E2E_DIR/keycheck.err" || rc=$?
+# A match fails even if grep also hit a read error (exit 2 with paths in keycheck.out).
+[ -s "$E2E_DIR/keycheck.out" ] && fail "the provider key appears in $(wc -l <"$E2E_DIR/keycheck.out" | tr -d ' ') file(s) under /workspace"
+case "$rc" in
+  1) log "the provider key file survived stop and start (mode 600), and no file under /workspace contains the key" ;;
+  *) fail "the /workspace key check failed (status $rc): $(grep -v 'Permanently added' "$E2E_DIR/keycheck.err" | head -n 5)" ;;
+esac
 log "after stop, start and reconnect the backend answers and /workspace kept the task's file"
 
 "$helper" down "$id" </dev/null >/dev/null 2>&1 && fail "down deleted without --yes or a prompt"
