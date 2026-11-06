@@ -21,11 +21,11 @@ A Runzivo sandbox is a Linux VM in the user's Runzivo workspace. Drive it only t
 
 ```sh
 rzv sandboxes create --name openhands-<slug> --json   # optional: --size 2vcpu-8gb --lifetime 8h|12h|24h
-for i in $(seq 30); do rzv sandboxes get <sandbox-id> | head -n 1 | grep -q ': running$' && break; sleep 10; done
+for i in $(seq 30); do rzv sandboxes get <sandbox-id> | head -n 1 | grep -Eq ': (running|failed|expired|deleted)' && break; sleep 10; done
 rzv sandboxes get <sandbox-id>                         # first line: <name> [<sandbox-id>]: <status>
 ```
 
-`create` and `start` return at once with status "starting". The loop waits up to 5 minutes; if it is still not running, show the user the `get` output.
+`create` and `start` return at once ("pending" or "starting"). The loop waits up to 5 minutes; if the status is not "running", show the user the `get` output.
 - Name it `openhands-<slug>`: lowercase letters, digits and hyphens, from the task (for example `openhands-fix-login`).
 - The id looks like `sbx_` plus 24 hex characters. Keep it; every other command needs it.
 - `rzv sandboxes sizes` and `rzv sandboxes list` show the sizes and lifetimes on offer. The default is 2vcpu-8gb for 8 hours.
@@ -43,7 +43,7 @@ Keep files under `/workspace`. Copy only what the user asked you to copy.
 
 ## 4. Status, cost and expiry
 
-`rzv sandboxes get <sandbox-id> --json` gives `.sandbox.status`, `expires_at`, `remaining_seconds`, `runtime_seconds` and `credits_used`. Report them in plain words, for example "running, 7h 42m left, 0.4 credits used". The lifetime cannot be extended; at expiry the sandbox and its files are deleted.
+`rzv sandboxes get <sandbox-id> --json` gives `.sandbox.status`, `expires_at`, `remaining_seconds`, `runtime_seconds` and `credits_used`. Report them in plain words, for example "running, 7h 42m left, 3.2 equivalent minutes of credit used". The lifetime cannot be extended; at expiry the sandbox and its files are deleted.
 
 ## 5. Stop, start, delete
 

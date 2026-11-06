@@ -56,13 +56,15 @@ export OPENHANDS_PERSISTENCE_DIR=$state PERSISTENCE_DIR=$state OPENHANDS_CONVERS
   OPENHANDS_WORK_DIR=$proj OPENHANDS_SUPPRESS_BANNER=1 LLM_MODEL=$model
 
 n=0
-turn() { # turn <prompt>; JSONL events in $E2E_DIR/turn-N.jsonl; each turn gets at most 10 minutes
-  n=$((n + 1)); log "turn $n: $1"
-  (cd "$proj" && LLM_API_KEY=$(cat "$OPENAI_KEY_FILE") exec "$OPENHANDS_BIN" --headless --json --override-with-envs -t "$1") \
+turn() { # turn <prompt> [conversation-id]; JSONL events in $E2E_DIR/turn-N.jsonl; at most 10 minutes each
+  n=$((n + 1)); log "turn $n: $1${2:+ (resuming $2)}"
+  local resume=()
+  [ -n "${2:-}" ] && resume=(--resume "$2")
+  (cd "$proj" && LLM_API_KEY=$(cat "$OPENAI_KEY_FILE") exec "$OPENHANDS_BIN" --headless --json --override-with-envs ${resume[@]+"${resume[@]}"} -t "$1") \
     >"$E2E_DIR/turn-$n.jsonl" 2>"$E2E_DIR/turn-$n.err" &
   local pid=$! waited=0
   while kill -0 "$pid" 2>/dev/null; do
-    if [ "$waited" -ge 600 ]; then log "turn $n timed out"; pkill -TERM -P "$pid"; kill "$pid"; break; fi
+    if [ "$waited" -ge 600 ]; then log "turn $n timed out"; pkill -TERM -P "$pid" || true; kill "$pid" || true; break; fi
     sleep 5; waited=$((waited + 5))
   done
   wait "$pid" || true
@@ -77,17 +79,24 @@ for f in sys.argv[1:]:
         a=e.get("action") or {}
         if e.get("kind")=="ActionEvent" and a.get("command"): print(a["command"])' "$@"
 }
-ran() { cmds "$last" | grep -q -- "$1"; }
+ran() { cmds "$last" | grep -- "$1" >/dev/null; }
+conv() { grep -o 'Conversation ID: [0-9a-f]*' "$last" | head -n 1 | awk '{print $3}'; }
 
-step() { # step <check-function> <prompt>: one headless run, retried once if the check fails
+step() { # step <check-function> <prompt>: one headless run; if the check fails, resume it with "Continue" up to 3 times
+  local c tries=0
   turn "$2"
-  if ! "$1"; then log "turn $n: check failed; the model may have stopped early, retrying once"; turn "$2"; "$1" || fail "turn $n: $1 failed"; fi
+  until "$1"; do
+    tries=$((tries + 1)); c=$(conv)
+    [ "$tries" -le 3 ] && [ -n "$c" ] || fail "turn $n: $1 failed"
+    log "turn $n: $1 not done yet; the model stopped early, resuming the conversation"
+    turn "Continue until the task is done." "$c"
+  done
 }
 created() { sid=$(ids | awk -v n="$name" '$2 == n {print $1}'); [ -n "$sid" ] && settle running; }
 wrote() { ran "ssh-config" && rzv sandboxes exec "$sid" -- 'cat /workspace/e2e.txt' 2>/dev/null | grep -q skill-ok; }
 showed() { ran "sandboxes get" && grep -qi "credit" "$last"; }
 stopped() { ran "sandboxes stop" && settle stopped; }
-woke() { cmds "$E2E_DIR"/turn-*.jsonl | grep -q "sandboxes start" && settle running && grep -q skill-ok "$last"; }
+woke() { cmds "$E2E_DIR"/turn-*.jsonl | grep "sandboxes start" >/dev/null && settle running && grep -q skill-ok "$last"; }
 asked() { [ "$(field status)" = running ] && ! ran "sandboxes delete"; }
 deleted() { ran "sandboxes delete"; }
 

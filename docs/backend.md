@@ -28,11 +28,11 @@ It needs `rzv` 0.26.0 or newer, signed in, and OpenSSH. Options for `up`: `--siz
 
 ## Model keys
 
-`key <sandbox-id> <ENV_NAME>` reads a provider key on stdin and writes it over SSH to a mode 600 file in the sandbox. The Agent Server reads it as that environment variable, so the SDK can create `LLM(model=...)` without sending a key. If you type a key into Agent Canvas settings instead, it travels through the tunnel and the server stores it encrypted in the sandbox. Never use `rzv sandboxes exec --env` for keys.
+`key <sandbox-id> <NAME_API_KEY>` reads a provider key on stdin and writes it over SSH to a mode 600 file in the sandbox (`~/.config/rzv-openhands/env/`). The Agent Server reads it as that environment variable, so the SDK can create `LLM(model=...)` without sending a key. The agent runs as the same user, so commands it runs can read that variable and file. Do not ask it to print its environment, and use a provider key you can revoke. If you type a key into Agent Canvas settings instead, it travels through the tunnel and the server stores it encrypted in the sandbox. Never use `rzv sandboxes exec --env` for keys.
 
 ## Stop, start and expiry
 
-A stop ends the server and the tunnel. After `start`, run `connect`. Conversations are kept in `/workspace/openhands`, which survives a stop and start until the sandbox expires (8, 12 or 24 hours); do not count on other files surviving. Expiry or `down` deletes everything.
+If the tunnel drops (a network change, or the SSH relay ends the connection), run `connect` again. A stop ends the server and the tunnel. After `start`, run `connect`; it sends the API key again and restarts the server. If `key` files are gone after a wake, run `key` again. Conversations are kept in `/workspace/openhands`, which survives a stop and start until the sandbox expires (8, 12 or 24 hours); do not count on other files surviving. Expiry or `down` deletes everything.
 
 ## Not available yet
 

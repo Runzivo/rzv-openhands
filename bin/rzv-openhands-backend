@@ -27,7 +27,7 @@ say() { printf '%s\n' "$*" >&2; }
 
 find_rzv() {
   if [ -n "${RZV_BIN:-}" ]; then RZV=$RZV_BIN
-  elif command -v rzv >/dev/null 2>&1; then RZV=$(command -v rzv)
+  elif type -P rzv >/dev/null; then RZV=$(type -P rzv)
   elif [ -x "$HOME/.local/bin/rzv" ]; then RZV=$HOME/.local/bin/rzv
   else die "rzv is not installed. Install it with: curl -fsSL https://runzivo.dev/downloads/rzv/install.sh | sh"
   fi
@@ -40,7 +40,7 @@ wait_running() {
   local s=""
   for _ in $(seq 60); do
     s=$(status_of "$1") || die "could not read sandbox $1"
-    case "$s" in running) return 0 ;; failed*|deleted*|expired*) break ;; esac
+    case "$s" in running) return 0 ;; failed*|deleted*|expired*|cleanup*) break ;; esac
     sleep 5
   done
   rzv sandboxes get "$1" >&2 || true
@@ -64,14 +64,17 @@ if [ ! -x "$bin" ]; then
 fi
 [ -s "$d/session.key" ] || { echo "session key missing" >&2; exit 1; }
 [ -s "$d/secret.key" ] || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$d/secret.key"
-if [ -f "$d/pid" ] && kill -0 "$(cat "$d/pid")" 2>/dev/null; then kill "$(cat "$d/pid")"; sleep 2; fi
+# Stop a server this helper started earlier: match its exact binary path, not a saved pid.
+pkill -f "^$bin --host 127.0.0.1 --port $PORT" 2>/dev/null || true
+for _ in $(seq 30); do pgrep -f "^$bin --host 127.0.0.1 --port $PORT" >/dev/null || break; sleep 1; done
+pgrep -f "^$bin --host 127.0.0.1 --port $PORT" >/dev/null && { echo "the old agent server did not stop" >&2; exit 1; }
 (
-  for f in "$d"/env/*; do [ -f "$f" ] && export "$(basename "$f")=$(cat "$f")"; done
+  for f in "$d"/env/*; do [ -s "$f" ] && export "$(basename "$f")=$(cat "$f")"; done
   OH_SESSION_API_KEYS_0=$(cat "$d/session.key") OH_SECRET_KEY=$(cat "$d/secret.key")
   export OH_SESSION_API_KEYS_0 OH_SECRET_KEY OH_CONVERSATIONS_PATH=/workspace/openhands/conversations OH_WORKSPACE_PATH=/workspace
-  cd /workspace && nohup "$bin" --host 127.0.0.1 --port "$PORT" >"$d/agent-server.log" 2>&1 </dev/null &
-  echo $! >"$d/pid"
-)
+  cd /workspace
+  exec nohup "$bin" --host 127.0.0.1 --port "$PORT" >"$d/agent-server.log" 2>&1 </dev/null
+) &
 for _ in $(seq 60); do curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && exit 0; sleep 2; done
 echo "agent server did not start; see ~/.config/rzv-openhands/agent-server.log in the sandbox" >&2; exit 1
 REMOTE
@@ -89,6 +92,9 @@ open_tunnel() {
 }
 
 connect() { # connect <id> <port>
+  local old
+  old=$(cat "$STATE/$1.port" 2>/dev/null || true)
+  [ -n "$old" ] && [ "$old" != "$2" ] && close_tunnel "$1" "$old"
   wait_running "$1"
   rzv sandboxes ssh-config "$1" --write >/dev/null
   [ -s "$STATE/$1.key" ] || die "no API key for $1 in $STATE; was it created with 'up'?"
@@ -102,7 +108,7 @@ connect() { # connect <id> <port>
   say "Delete it when done: rzv-openhands-backend down $1"
 }
 
-port_arg() { [[ "$1" =~ ^[0-9]{2,5}$ ]] || die "--port must be a number"; echo "$1"; }
+port_arg() { [[ "$1" =~ ^[0-9]{4,5}$ ]] && [ "$1" -ge 1024 ] && [ "$1" -le 65535 ] || die "--port must be 1024 to 65535"; echo "$1"; }
 
 main() {
   [ $# -ge 1 ] || { usage; exit 2; }
@@ -129,18 +135,24 @@ main() {
       id=$(rzv sandboxes create --name "openhands-$slug" ${args[@]+"${args[@]}"} --json | grep -o 'sbx_[0-9a-f]\{24\}' | head -n 1) || true
       check_id "$id"
       say "Created openhands-$slug [$id]. Waiting for it to run..."
+      trap 'say "Setup failed. The sandbox still exists and is billed while it runs; delete it with: rzv-openhands-backend down $id"' EXIT
       (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$STATE/$id.key")
-      connect "$id" "$port" ;;
+      connect "$id" "$port"
+      trap - EXIT ;;
     connect)
       check_id "${1:-}"; local id=$1 port; shift
       port=$(cat "$STATE/$id.port" 2>/dev/null || echo 8000)
-      [ "${1:-}" = --port ] && port=$(port_arg "${2:?}")
+      case "${1:-}" in "") ;; --port) port=$(port_arg "${2:?}") ;; *) die "unknown option $1" ;; esac
       connect "$id" "$port" ;;
     key)
-      check_id "${1:-}"; [[ "${2:-}" =~ ^[A-Z][A-Z0-9_]{1,63}$ ]] || die "usage: key <sandbox-id> <ENV_NAME> < key-file"
+      check_id "${1:-}"
+      [[ "${2:-}" =~ ^[A-Z][A-Z0-9_]{0,50}_(API_KEY|KEY|TOKEN)$ ]] && [[ ! "$2" =~ ^(OH_|SESSION_) ]] \
+        || die "usage: key <sandbox-id> <NAME_API_KEY> < key-file (a name ending in _API_KEY, _KEY or _TOKEN)"
       [ -t 0 ] && die "pipe the key on stdin, for example: <password-manager-command> | rzv-openhands-backend key $1 $2"
       rzv sandboxes ssh-config "$1" --write >/dev/null
-      ssh -o BatchMode=yes "$1.rzv" "umask 077; mkdir -p ~/.config/rzv-openhands/env && cat > ~/.config/rzv-openhands/env/$2"
+      local k; k=$(cat); [ -n "$k" ] || die "no key on stdin; nothing was saved"
+      printf '%s' "$k" | ssh -o BatchMode=yes "$1.rzv" "umask 077; mkdir -p ~/.config/rzv-openhands/env && cat > ~/.config/rzv-openhands/env/$2"
+      unset k
       say "Saved $2 in the sandbox (mode 600). Run 'rzv-openhands-backend connect $1' to restart the server with it." ;;
     status) check_id "${1:-}"; rzv sandboxes get "$1" ;;
     stop) check_id "${1:-}"; close_tunnel "$1" "$(cat "$STATE/$1.port" 2>/dev/null || echo 8000)"; rzv sandboxes stop "$1" ;;
